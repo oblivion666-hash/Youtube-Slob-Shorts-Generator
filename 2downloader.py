@@ -59,14 +59,18 @@ def generate_srt(video_path, srt_path):
             for word in segment.words:
                 all_words.append(word)
 
-    words_per_chunk = 3
     with open(srt_path, "w") as f:
-        for i, chunk_start in enumerate(range(0, len(all_words), words_per_chunk), start=1):
-            chunk = all_words[chunk_start:chunk_start + words_per_chunk]
-            start = format_srt_time(chunk[0].start)
-            end = format_srt_time(chunk[-1].end)
-            text = " ".join(w.word.strip() for w in chunk)
-            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+     i = 1
+     idx = 0
+     while idx < len(all_words):
+        chunk_size = random.randint(1, 5)
+        chunk = all_words[idx:idx + chunk_size]
+        start = format_srt_time(chunk[0].start)
+        end = format_srt_time(chunk[-1].end)
+        text = " ".join(w.word.strip() for w in chunk)
+        f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+        idx += chunk_size
+        i += 1
 
 def format_srt_time(seconds):
     h = int(seconds // 3600)
@@ -295,6 +299,7 @@ def start_download_thread(url, folder, gameplay, resolution, captions_enabled, c
         set_controls_state("normal")
         app.after(0, update_download_button_state)
         app.after(0, update_add_clip_button_state)
+
 def get_video_clip(url, sections, progress_hook=None, resolution="720p", clip_id=0):
     if resolution == "1080p":
         fmt = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
@@ -568,7 +573,7 @@ class App(ctk.CTk, TkinterDnD.Tk):
 
 app = App()
 app.title("YouTube Slop-Generator")
-app.geometry("1050x380")
+app.geometry("1050x500")
 app.grid_columnconfigure(0, weight=1)
 app.grid_columnconfigure(1, weight=3)
 app.grid_columnconfigure(2, weight=1)
@@ -649,10 +654,93 @@ quality_menu = ctk.CTkOptionMenu(settings_frame, variable=quality_var,
                                         "GTA"])
 quality_menu.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
 
+
+
+def get_ffmpeg_fonts():
+    try:
+        # Fragt fontconfig nach allen eindeutigen Schriftfamilien-Namen im System
+        result = subprocess.run(
+            ["fc-list", ":", "family"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # Namen filtern, Duplikate entfernen und alphabetisch sortieren
+        fonts = set()
+        for line in result.stdout.splitlines():
+            # fc-list trennt manchmal alternative Namen mit Kommas
+            first_name = line.split(",")[0].strip()
+            if first_name:
+                fonts.add(first_name)
+
+        return sorted(list(fonts))
+    except Exception:
+        # Fallback, falls fc-list auf dem System fehlt oder einen Fehler wirft
+        return ["Arial", "Impact", "Sans", "Courier New"]
+
+caption_popup = None
+
+def toggle_caption_popup():
+    global caption_popup
+
+
+    if caption_var.get() == 1:
+
+        if caption_popup is None or not caption_popup.winfo_exists():
+
+
+            caption_popup = ctk.CTkToplevel()
+            caption_popup.title("Caption Settings")
+            caption_popup.geometry("300x200")
+            caption_popup.lift()
+            caption_popup.attributes("-topmost", True)
+
+
+            font_label = ctk.CTkLabel(caption_popup, text="Font")
+            font_label.grid(row=1, column=0, padx=10, pady=5)
+            # 1. Alle für FFmpeg verfügbaren System-Schriften laden
+            available_fonts = get_ffmpeg_fonts()
+
+            # 2. Variable für die ausgewählte Schriftart (Standard: erste aus der Liste oder Arial)
+            default_font = "Arial" if "Arial" in available_fonts else available_fonts[0]
+            font_var = ctk.StringVar(value=default_font)
+
+            # 3. Das OptionMenu erstellen und die System-Schriften übergeben
+            font_menu = ctk.CTkOptionMenu(
+                caption_popup,       # Das Pop-up als Master übergeben
+                variable=font_var,
+                values=available_fonts  # <-- Hier ist Ihre dynamische Liste!
+            )
+            font_menu.grid(row=1, column=1, padx=10, pady=5)
+
+
+            caption_popup.protocol("WM_DELETE_WINDOW", close_caption_popup)
+
+    else:
+
+        if caption_popup and caption_popup.winfo_exists():
+            caption_popup.destroy()
+
+def close_caption_popup():
+    global caption_popup
+
+    caption_checkbox.deselect()
+    if caption_popup:
+        caption_popup.destroy()
+
+
+
+
+
 # Caption Checkbox
 caption_var = ctk.BooleanVar(value=False)
-caption_checkbox = ctk.CTkCheckBox(settings_frame, text="Add Captions", variable=caption_var)
+caption_checkbox = ctk.CTkCheckBox(settings_frame, text="Add Captions", variable=caption_var, command=toggle_caption_popup)
 caption_checkbox.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+
+
+
 
 # Buttons and Resolution Menu
 folder_button = ctk.CTkButton(app, text="Download Folder", command=choose_folder)
