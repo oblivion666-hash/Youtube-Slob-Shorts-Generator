@@ -10,12 +10,66 @@ import subprocess
 import re
 from faster_whisper import WhisperModel
 from tkinterdnd2 import TkinterDnD, DND_TEXT
-
+from heatmap import fetch_heatmap_clips
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")#set color theme for app
 
 #-------Backend---------#
+
+
+
+
+def download_full_video(url, resolution="720p", progress_hook=None):
+    if resolution == "1080p":
+        fmt = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+    elif resolution == "480p":
+        fmt = "bestvideo[height<=480]+bestaudio/best[height<=480]"
+    else:
+        fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]"
+
+    ydl_opts = {
+        "format": fmt,
+        "outtmpl": "%(title)s_source.%(ext)s",
+        "merge_output_format": "mp4",
+        "overwrites": True,
+    }
+    if progress_hook:
+        ydl_opts["progress_hooks"] = [progress_hook]
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        for ext in [".webm", ".mkv", ".ytdl"]:
+            filename = filename.replace(ext, ".mp4")
+        title = info.get("title", "video")
+    return filename, title
+
+
+def cut_clip_from_source(source_path, start_ts, end_ts, output_path):
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", start_ts,
+        "-to", end_ts,
+        "-i", source_path,
+        "-c", "copy",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Clip cut failed: {result.stderr[-500:]}")
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -112,98 +166,91 @@ def trigger_download():
     ).start()
 
 def start_download_thread(url, folder, gameplay, resolution, captions_enabled, custom_name, multiclip_enabled, start_ts, end_ts):
+    source_file = None
     try:
-        # Determine list of clips to process
         if multiclip_enabled:
             clips = list(clips_list)
         else:
             clips = [(start_ts, end_ts)]
-            
+
         if not clips:
             raise ValueError("No clips added to the queue!")
 
-        # Reset progress bar
         app.after(0, lambda: progress_bar.set(0))
         total_clips = len(clips)
-        
-        # Process each clip sequentially
+
+        # Phase 1: download full video once (progress 0% → 40%)
+        def ytdl_hook(d):
+            if d['status'] == 'downloading':
+                total = d.get('total_bytes') or d.get('total_bytes_estimate')
+                downloaded = d.get('downloaded_bytes', 0)
+                if total:
+                    app.after(0, lambda p=downloaded/total*0.4: progress_bar.set(p))
+            elif d['status'] == 'finished':
+                app.after(0, lambda: progress_bar.set(0.4))
+
+        update_status("Downloading video...", "#3b82f6")
+        source_file, video_title = download_full_video(url, resolution, progress_hook=ytdl_hook)
+
+        if not os.path.exists(source_file):
+            raise FileNotFoundError(f"Downloaded video file not found: {source_file}")
+
+        # Resolution parameters (used by ffmpeg stack later)
+        if resolution == "1080p":
+            width, clip_height = 1080, 960
+        elif resolution == "480p":
+            width, clip_height = 480, 426
+        else:
+            width, clip_height = 720, 640
+
+        # Phase 2: cut + process each clip (progress 40% → 100%)
         for idx, (start_str, end_str) in enumerate(clips):
             clip_duration = time_to_seconds(end_str) - time_to_seconds(start_str)
             if clip_duration <= 0:
                 raise ValueError(f"Clip {idx+1}: End time must be greater than start time")
-                
-            sections = [(normalize_time(start_str), normalize_time(end_str))]
-            
-            # Define progress hook for yt-dlp (Stage 1: 0% to 50% of this clip's portion)
-            def ytdl_hook(d):
-                if d['status'] == 'downloading':
-                    total = d.get('total_bytes') or d.get('total_bytes_estimate')
-                    downloaded = d.get('downloaded_bytes', 0)
-                    if total:
-                        percent = downloaded / total
-                        clip_progress = percent * 0.5
-                        overall_progress = (idx + clip_progress) / total_clips
-                        app.after(0, lambda: progress_bar.set(overall_progress))
-                elif d['status'] == 'finished':
-                    overall_progress = (idx + 0.5) / total_clips
-                    app.after(0, lambda: progress_bar.set(overall_progress))
-            
-            # Get selected resolution parameters
-            if resolution == "1080p":
-                width = 1080
-                clip_height = 960
-            elif resolution == "480p":
-                width = 480
-                clip_height = 426
-            else: # Default/720p
-                width = 720
-                clip_height = 640
 
-            update_status(f"[{idx+1}/{total_clips}] Downloading YouTube clip...", "#3b82f6")
-            # Download clip with the resolution constraint
-            raw_filename, video_title = get_video_clip(url, sections, progress_hook=ytdl_hook, resolution=resolution, clip_id=idx)
-            
+            clip_base = 0.4 + (idx / total_clips) * 0.6
+
+            update_status(f"[{idx+1}/{total_clips}] Cutting clip...", "#3b82f6")
+            raw_filename = f"raw_clip_{idx}.mp4"
+            cut_clip_from_source(source_file, normalize_time(start_str), normalize_time(end_str), raw_filename)
+            app.after(0, lambda p=clip_base + 0.05/total_clips: progress_bar.set(p))
+
             if not os.path.exists(raw_filename):
-                raise FileNotFoundError(f"Downloaded video file not found: {raw_filename}")
-                
+                raise FileNotFoundError(f"Clip file not found after cutting: {raw_filename}")
+
             update_status(f"[{idx+1}/{total_clips}] Processing gameplay footage...", "#3b82f6")
             gameplay_type, random_start = get_gameplay_with_val(gameplay, clip_duration)
-            
-            # Determine output filename
+
             def sanitize_for_path(name):
                 cleaned = re.sub(r"[^\w\s\.-]", "", name)
                 cleaned = re.sub(r"\s+", "_", cleaned)
                 return cleaned.strip("_")
 
             if total_clips > 1:
-                # Suffix index if multiple clips are downloaded
                 if custom_name:
                     base_custom = custom_name[:-4] if custom_name.lower().endswith(".mp4") else custom_name
                     final_filename = f"{sanitize_for_path(base_custom)}_{idx+1}.mp4"
                 else:
-                    sanitized_title = sanitize_for_path(video_title)
-                    final_filename = f"{sanitized_title}_{idx+1}.mp4"
+                    final_filename = f"{sanitize_for_path(video_title)}_{idx+1}.mp4"
             else:
                 if custom_name:
                     base_custom = custom_name[:-4] if custom_name.lower().endswith(".mp4") else custom_name
                     final_filename = sanitize_for_path(base_custom) + ".mp4"
                 else:
-                    sanitized_title = sanitize_for_path(video_title)
-                    final_filename = f"{sanitized_title}_{start_str.replace(':', '_')}_to_{end_str.replace(':', '_')}.mp4"
-                
-            # Generate subtitles path - sanitizing the name to make it safe for FFmpeg subtitles filter
+                    final_filename = f"{sanitize_for_path(video_title)}_{start_str.replace(':', '_')}_to_{end_str.replace(':', '_')}.mp4"
+
             raw_basename = os.path.basename(raw_filename)
             safe_base = re.sub(r"[^\w.-]", "_", raw_basename)
             srt_path = safe_base.replace(".mp4", ".srt")
-            
+
             if captions_enabled:
                 update_status(f"[{idx+1}/{total_clips}] Transcribing audio for captions...", "#3b82f6")
                 generate_srt(raw_filename, srt_path)
-                
+
             update_status(f"[{idx+1}/{total_clips}] Combining and rendering video with FFmpeg...", "#eab308")
             output_path = os.path.join(folder, final_filename)
-            
-            # Run ffmpeg to stack the main clip and gameplay clip
+
             srt_path_ffmpeg = srt_path.replace("\\", "/").replace(":", "\\:")
             if captions_enabled and os.path.exists(srt_path):
                 filter_complex = (
@@ -218,6 +265,7 @@ def start_download_thread(url, folder, gameplay, resolution, captions_enabled, c
                     f"[1:v]scale=w='max({width},iw*{clip_height}/ih)':h={clip_height},crop={width}:{clip_height}[v1];"
                     f"[v0][v1]vstack=inputs=2[v]"
                 )
+
             cmd = [
                 "ffmpeg", "-y",
                 "-i", raw_filename,
@@ -235,70 +283,60 @@ def start_download_thread(url, folder, gameplay, resolution, captions_enabled, c
                 "-shortest",
                 output_path
             ]
-            
-            # Execute command and track progress (Stage 2: 50% to 95% of this clip's portion)
+
             process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                errors="replace"
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1, universal_newlines=True, errors="replace"
             )
-            
+
             time_pattern = re.compile(r"time=(-?\d{2}):(\d{2}):(\d{2})\.(\d+)")
             stderr_lines = []
-            
+
             while True:
                 line = process.stderr.readline()
                 if not line:
                     break
                 stderr_lines.append(line)
-                
-                # Parse time
                 match = time_pattern.search(line)
                 if match:
-                    hours, minutes, seconds, fraction_part = match.groups()
-                    hours, minutes, seconds = int(hours), int(minutes), int(seconds)
-                    sign = -1 if hours < 0 or (hours == 0 and "-" in match.group(1)) else 1
-                    hours = abs(hours)
-                    fraction = float(f"0.{fraction_part}")
-                    current_seconds = sign * (hours * 3600 + minutes * 60 + seconds + fraction)
+                    h, m, s, frac = match.groups()
+                    h, m, s = int(h), int(m), int(s)
+                    sign = -1 if "-" in match.group(1) else 1
+                    current_seconds = sign * (abs(h)*3600 + m*60 + s + float(f"0.{frac}"))
                     if clip_duration > 0:
-                        ffmpeg_percent = current_seconds / clip_duration
-                        clip_progress = 0.5 + 0.45 * min(1.0, ffmpeg_percent)
-                        overall_progress = (idx + clip_progress) / total_clips
-                        app.after(0, lambda p=overall_progress: progress_bar.set(p))
-                        
+                        ffmpeg_pct = min(1.0, current_seconds / clip_duration)
+                        overall = clip_base + (0.6 / total_clips) * ffmpeg_pct
+                        app.after(0, lambda p=overall: progress_bar.set(p))
+
             process.wait()
             if process.returncode != 0:
                 raise RuntimeError(f"FFmpeg error: {''.join(stderr_lines[-10:])}")
-                
-            # Cleanup
+
             if os.path.exists(raw_filename):
                 os.remove(raw_filename)
-            if 'srt_path' in locals() and os.path.exists(srt_path):
+            if os.path.exists(srt_path):
                 os.remove(srt_path)
-                
+
         update_status("Finished! All videos saved successfully.", "#10b981")
         app.after(0, lambda: progress_bar.set(1.0))
+
     except Exception as e:
-        if 'srt_path' in locals() and os.path.exists(srt_path):
-            try:
-                os.remove(srt_path)
-            except Exception:
-                pass
-        if 'raw_filename' in locals() and os.path.exists(raw_filename):
-            try:
-                os.remove(raw_filename)
-            except Exception:
-                pass
+        for f in [locals().get('srt_path'), locals().get('raw_filename')]:
+            if f and os.path.exists(f):
+                try: os.remove(f)
+                except Exception: pass
         update_status(f"Error: {str(e)}", "#ef4444")
     finally:
+        if source_file and os.path.exists(source_file):
+            try: os.remove(source_file)
+            except Exception: pass
         set_controls_state("normal")
         app.after(0, update_download_button_state)
         app.after(0, update_add_clip_button_state)
+
+
+
+
 
 def get_video_clip(url, sections, progress_hook=None, resolution="720p", clip_id=0):
     if resolution == "1080p":
@@ -312,7 +350,6 @@ def get_video_clip(url, sections, progress_hook=None, resolution="720p", clip_id
         "format": fmt,
         "outtmpl": f"%(title)s_clip{clip_id}.%(ext)s",   # unique per clip
         "download_sections": [f"*{start}-{end}" for start, end in sections],
-        "force_keyframes_at_cuts": True,
         "merge_output_format": "mp4",
         "continuedl": False,     # never try to resume/reuse a partial from a prior clip
         "overwrites": True,      # always start clean
@@ -514,6 +551,54 @@ def refresh_queue_ui():
         )
         remove_btn.pack(side="right", padx=5, pady=5)
 
+
+
+
+def fetch_heatmap_from_url():
+    url = url_entry.get().strip()
+    if not url:
+        update_status("Error: Please enter a YouTube URL first!", "#ef4444")
+        return
+
+    update_status("Fetching heatmap data from YouTube...", "#3b82f6")
+    fetch_heatmap_button.configure(state="disabled")
+
+    def _fetch():
+        try:
+            clips, title = fetch_heatmap_clips(url)
+
+            if not clips:
+                app.after(0, lambda: update_status(
+                    "No heatmap data available for this video.", "#eab308"
+                ))
+                return
+
+            added = 0
+            for clip in clips:
+                if clip not in clips_list:
+                    clips_list.append(clip)
+                    added += 1
+
+            if added > 0:
+                multiclip_var.set(True)
+                app.after(0, refresh_queue_ui)
+                app.after(0, update_all_states)
+                short_title = (title[:35] + "...") if title and len(title) > 35 else (title or "video")
+                app.after(0, lambda: update_status(
+                    f"Added {added} most-replayed clips from: {short_title}", "#10b981"
+                ))
+            else:
+                app.after(0, lambda: update_status(
+                    "All heatmap clips are already in the queue.", "#eab308"
+                ))
+
+        except Exception as e:
+            app.after(0, lambda err=str(e): update_status(f"Heatmap error: {err}", "#ef4444"))
+        finally:
+            app.after(0, lambda: fetch_heatmap_button.configure(state="normal"))
+
+    threading.Thread(target=_fetch, daemon=True).start()
+
 def set_controls_state(state):
     url_entry.configure(state=state)
     filename_entry.configure(state=state)
@@ -522,6 +607,8 @@ def set_controls_state(state):
     folder_button.configure(state=state)
     resolution_menu.configure(state=state)
     download_button.configure(state=state)
+    if 'fetch_heatmap_button' in globals():
+        fetch_heatmap_button.configure(state=state)
     
     for entry in [start_h_entry, start_m_entry, start_s_entry, end_h_entry, end_m_entry, end_s_entry]:
         entry.configure(state="disabled" if state == "disabled" else "normal")
@@ -758,19 +845,35 @@ download_button.grid(row=3, column=2, columnspan=2, padx=20, pady=20, sticky="ew
 queue_frame = ctk.CTkFrame(app)
 queue_frame.grid(row=0, column=4, columnspan=1, rowspan=4, padx=10, pady=10, sticky="nsew")
 queue_frame.grid_columnconfigure(0, weight=1)
-queue_frame.grid_rowconfigure(1, weight=1)
+queue_frame.grid_rowconfigure(2, weight=1)
+
+
+
+
 
 queue_title = ctk.CTkLabel(queue_frame, text="Clip Queue", font=("Helvetica", 14, "bold"))
 queue_title.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
 
+# NEW: heatmap fetch button
+fetch_heatmap_button = ctk.CTkButton(
+    queue_frame,
+    text=" Fetch Most-Replayed Clips",
+    command=fetch_heatmap_from_url,
+    fg_color="#1d4ed8",
+    hover_color="#1e40af"
+)
+fetch_heatmap_button.grid(row=1, column=0, padx=10, pady=(0, 5), sticky="ew")
+
 queue_list_frame = ctk.CTkScrollableFrame(queue_frame, height=140)
-queue_list_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+queue_list_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")   # was row=1
 
 multiclip_checkbox = ctk.CTkCheckBox(queue_frame, text="Enable Multi-clip Mode", variable=multiclip_var, command=update_download_button_state)
-multiclip_checkbox.grid(row=2, column=0, padx=10, pady=5, sticky="w")
+multiclip_checkbox.grid(row=3, column=0, padx=10, pady=5, sticky="w")    # was row=2
 
 clear_queue_button = ctk.CTkButton(queue_frame, text="Clear Queue", command=clear_queue, fg_color="#374151", hover_color="#4b5563")
-clear_queue_button.grid(row=3, column=0, padx=10, pady=(5, 10), sticky="ew")
+clear_queue_button.grid(row=4, column=0, padx=10, pady=(5, 10), sticky="ew")  # was row=3
+
+
 
 refresh_queue_ui()
 update_all_states()
